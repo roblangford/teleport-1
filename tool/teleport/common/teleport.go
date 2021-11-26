@@ -27,18 +27,25 @@ import (
 	"strings"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/config"
+	dbconfigurators "github.com/gravitational/teleport/lib/configurators/databases"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/service"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/sshutils/scp"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/prompt"
 
 	"github.com/gravitational/kingpin"
 	"github.com/gravitational/trace"
 	log "github.com/sirupsen/logrus"
 )
+
+// awsDatabaseTypes list of databases supported on the configurator.
+var awsDatabaseTypes = []string{types.DatabaseTypeRDS, types.DatabaseTypeRedshift}
 
 // Options combines init/start teleport options
 type Options struct {
@@ -64,10 +71,15 @@ func Run(options Options) (app *kingpin.Application, executedCommand string, con
 	app = utils.InitCLIParser("teleport", "Clustered SSH service. Learn more at https://goteleport.com/teleport")
 
 	// define global flags:
-	var ccf config.CommandLineFlags
-	var scpFlags scp.Flags
-	var dumpFlags dumpFlags
-	var dbConfigCreateFlags createDatabaseConfigFlags
+	var (
+		ccf                             config.CommandLineFlags
+		scpFlags                        scp.Flags
+		dumpFlags                       dumpFlags
+		configureDatabaseAWSPrintFlags  configureDatabaseAWSPrintFlags
+		configureDatabaseAWSCreateFlags configureDatabaseAWSCreateFlags
+		configureDatabaseBootstrapFlags configureDatabaseBootstrapFlags
+		dbConfigCreateFlags             createDatabaseConfigFlags
+	)
 
 	// define commands:
 	start := app.Command("start", "Starts the Teleport service.")
@@ -211,7 +223,8 @@ func Run(options Options) (app *kingpin.Application, executedCommand string, con
 	dbStartCmd.Flag("diag-addr", "Start diagnostic prometheus and healthz endpoint.").StringVar(&ccf.DiagnosticAddr)
 	dbStartCmd.Flag("insecure", "Insecure mode disables certificate validation").BoolVar(&ccf.InsecureMode)
 	dbStartCmd.Alias(dbUsageExamples) // We're using "alias" section to display usage examples.
-	dbConfigure := dbCmd.Command("configure", "Provides commands for configuring Database Service agents.")
+
+	dbConfigure := dbCmd.Command("configure", "Bootstraps database service configuration and cloud permissions.")
 	dbConfigureCreate := dbConfigure.Command("create", "Creates a sample Database Service configuration.")
 	dbConfigureCreate.Flag("proxy", fmt.Sprintf("Teleport proxy address to connect to [%s].", defaults.ProxyWebListenAddr().Addr)).
 		Default(defaults.ProxyWebListenAddr().Addr).
@@ -228,6 +241,35 @@ func Run(options Options) (app *kingpin.Application, executedCommand string, con
 		"Write to stdout with -o=stdout, default config file with -o=file or custom path with -o=file:///path").Short('o').Default(
 		teleport.SchemeStdout).StringVar(&dbConfigCreateFlags.output)
 	dbConfigureCreate.Alias(dbCreateConfigExamples) // We're using "alias" section to display usage examples.
+
+	dbConfigureBootstrap := dbConfigure.Command("bootstrap", "Bootstrap the necessary configuration for the database agent. It reads the provided agent configuration to determine what will be bootstrapped.")
+	dbConfigureBootstrap.Flag("config", fmt.Sprintf("Path to a configuration file [%v].", defaults.ConfigFilePath)).Short('c').ExistingFileVar(&configureDatabaseBootstrapFlags.config.ConfigPath)
+	dbConfigureBootstrap.Flag("manual", "When executed in \"manual\" mode, it will print the instructions to complete the configuration instead of applying them directly.").BoolVar(&configureDatabaseBootstrapFlags.config.Manual)
+	dbConfigureBootstrap.Flag("policy-name", fmt.Sprintf("Name of the Teleport Database agent policy. Default: %q", dbconfigurators.DefaultPolicyName)).Default(dbconfigurators.DefaultPolicyName).StringVar(&configureDatabaseBootstrapFlags.config.PolicyName)
+	dbConfigureBootstrap.Flag("confirm", "Do not prompt user and auto-confirm all actions.").BoolVar(&configureDatabaseBootstrapFlags.confirm)
+	dbConfigureBootstrap.Flag("attach-to-role", "Role name to attach policy to. Mutually exclusive with --attach-to-user. If none of the attach-to flags is provided, the command will try to attach the policy to the current user/role based on the credentials.").StringVar(&configureDatabaseBootstrapFlags.config.AttachToRole)
+	dbConfigureBootstrap.Flag("attach-to-user", "User name to attach policy to. Mutually exclusive with --attach-to-role. If none of the attach-to flags is provided, the command will try to attach the policy to the current user/role based on the credentials.").StringVar(&configureDatabaseBootstrapFlags.config.AttachToUser)
+
+	dbConfigureAWS := dbConfigure.Command("aws", "Bootstrap for AWS hosted databases.")
+	dbConfigureAWSPrintIAM := dbConfigureAWS.Command("print-iam", "Generate and show IAM policies.")
+	dbConfigureAWSPrintIAM.Flag("types",
+		fmt.Sprintf("Comma-separated list of database types to include in the policy. Any of %s", strings.Join(awsDatabaseTypes, ","))).
+		Short('r').
+		StringVar(&configureDatabaseAWSPrintFlags.types)
+	dbConfigureAWSPrintIAM.Flag("role", "IAM role name to attach policy to. Mutually exclusive with --user").StringVar(&configureDatabaseAWSPrintFlags.role)
+	dbConfigureAWSPrintIAM.Flag("user", "IAM user name to attach policy to. Mutually exclusive with --role").StringVar(&configureDatabaseAWSPrintFlags.user)
+	dbConfigureAWSPrintIAM.Flag("policy", "Only print IAM policy document.").BoolVar(&configureDatabaseAWSPrintFlags.policyOnly)
+	dbConfigureAWSPrintIAM.Flag("boundary", "Only print IAM boundary policy document.").BoolVar(&configureDatabaseAWSPrintFlags.boundaryOnly)
+	dbConfigureAWSCreateIAM := dbConfigureAWS.Command("create-iam", "Generate, create and attach IAM policies.")
+	dbConfigureAWSCreateIAM.Flag("types",
+		fmt.Sprintf("Comma-separated list of database types to include in the policy. Any of %s", strings.Join(awsDatabaseTypes, ","))).
+		Short('r').
+		StringVar(&configureDatabaseAWSCreateFlags.types)
+	dbConfigureAWSCreateIAM.Flag("name", "Created policy name. Defaults to empty. Will be auto-generated if not provided.").Default(dbconfigurators.DefaultPolicyName).StringVar(&configureDatabaseAWSCreateFlags.policyName)
+	dbConfigureAWSCreateIAM.Flag("attach", "Try to attach the policy to the IAM identity.").Default("true").BoolVar(&configureDatabaseAWSCreateFlags.attach)
+	dbConfigureAWSCreateIAM.Flag("confirm", "Do not prompt user and auto-confirm all actions.").BoolVar(&configureDatabaseAWSCreateFlags.confirm)
+	dbConfigureAWSCreateIAM.Flag("role", "IAM role name to attach policy to. Mutually exclusive with --user").StringVar(&configureDatabaseAWSCreateFlags.role)
+	dbConfigureAWSCreateIAM.Flag("user", "IAM user name to attach policy to. Mutually exclusive with --role").StringVar(&configureDatabaseAWSCreateFlags.user)
 
 	// define a hidden 'scp' command (it implements server-side implementation of handling
 	// 'scp' requests)
@@ -307,6 +349,12 @@ func Run(options Options) (app *kingpin.Application, executedCommand string, con
 		utils.PrintVersion()
 	case dbConfigureCreate.FullCommand():
 		err = onDumpDatabaseConfig(dbConfigCreateFlags)
+	case dbConfigureAWSPrintIAM.FullCommand():
+		err = onConfigureDatabasesAWSPrint(configureDatabaseAWSPrintFlags)
+	case dbConfigureAWSCreateIAM.FullCommand():
+		err = onConfigureDatabasesAWSCreate(configureDatabaseAWSCreateFlags)
+	case dbConfigureBootstrap.FullCommand():
+		err = onConfigureDatabaseBootstrap(configureDatabaseBootstrapFlags)
 	}
 	if err != nil {
 		utils.FatalError(err)
@@ -591,6 +639,252 @@ func onForward() error {
 func onCheckHome() error {
 	srv.RunAndExit(teleport.CheckHomeDirSubCommand)
 	return nil
+}
+
+// configureDatabaseBootstrapFlags database configure bootstrap flags.
+type configureDatabaseBootstrapFlags struct {
+	config  dbconfigurators.BootstrapFlags
+	confirm bool
+}
+
+// onConfigureDatabaseBootstrap subcommand that bootstraps configuration for
+// database agents.
+func onConfigureDatabaseBootstrap(flags configureDatabaseBootstrapFlags) error {
+	ctx := context.TODO()
+	configurators, err := dbconfigurators.BuildConfigurators(flags.config)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	fmt.Printf("Reading configuration at %q...\n\n", flags.config.ConfigPath)
+	if len(configurators) == 0 {
+		fmt.Println("The agent doesn’t require any extra configuration.")
+		return nil
+	}
+
+	for _, configurator := range configurators {
+		fmt.Println(configurator.Name())
+		printDBConfiguratorActions(configurator.Actions())
+	}
+
+	if flags.config.Manual {
+		return nil
+	}
+
+	fmt.Print("\n")
+	if !flags.confirm {
+		confirmed, err := prompt.Confirmation(ctx, os.Stdout, prompt.Stdin(), "Confirm?")
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		if !confirmed {
+			return nil
+		}
+	}
+
+	for _, configurator := range configurators {
+		err = executeDBConfiguratorActions(ctx, configurator.Name(), configurator.Actions())
+		if err != nil {
+			return trace.Errorf("bootstrap failed to execute, check logs above to see the cause")
+		}
+	}
+
+	return nil
+}
+
+// configureDatabaseAWSFlags common flags provided to aws DB configurators.
+type configureDatabaseAWSFlags struct {
+	// types comma-separated list of database types that the policies will give
+	// access to.
+	types string
+	// typesList parsed `types` into list of types.
+	typesList []string
+	// role the AWS role that policies will be attached to.
+	role string
+	// user the AWS user that policies will be attached to.
+	user string
+	// policyName name of the generated policy.
+	policyName string
+}
+
+func (f *configureDatabaseAWSFlags) CheckAndSetDefaults() error {
+	if f.types == "" {
+		return trace.BadParameter("at least one --types should be provided: %s", strings.Join(awsDatabaseTypes, ","))
+	}
+
+	f.typesList = strings.Split(f.types, ",")
+	for _, dbType := range f.typesList {
+		if !apiutils.SliceContainsStr(awsDatabaseTypes, dbType) {
+			return trace.BadParameter("--types %q not supported. supported types are: %s", dbType, strings.Join(awsDatabaseTypes, ", "))
+		}
+	}
+
+	return nil
+}
+
+// configureDatabaseAWSPrintFlags flags of the "db configure aws print-iam"
+// subcommand.
+type configureDatabaseAWSPrintFlags struct {
+	configureDatabaseAWSFlags
+	// policyOnly if "true" will only prints the policy JSON.
+	policyOnly bool
+	// boundaryOnly if "true" will only prints the policy boundary JSON.
+	boundaryOnly bool
+}
+
+// buildAWSConfigurator builds the database configurator used on AWS-specific
+// commands.
+func buildAWSConfigurator(manual bool, flags configureDatabaseAWSFlags) (dbconfigurators.Configurator, error) {
+	err := flags.CheckAndSetDefaults()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	fileConfig := &config.FileConfig{}
+	configuratorFlags := dbconfigurators.BootstrapFlags{
+		Manual:       manual,
+		PolicyName:   flags.policyName,
+		AttachToUser: flags.user,
+		AttachToRole: flags.role,
+	}
+
+	for _, dbType := range flags.typesList {
+		switch dbType {
+		case types.DatabaseTypeRDS:
+			configuratorFlags.ForceRDSPermissions = true
+		}
+	}
+
+	configurator, err := dbconfigurators.NewAWSConfigurator(dbconfigurators.AWSConfiguratorConfig{
+		Flags:      configuratorFlags,
+		FileConfig: fileConfig,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return configurator, nil
+}
+
+// onConfigureDatabasesAWSPrint is a subcommand used to print AWS IAM access
+// Teleport requires to run databases discovery on AWS.
+func onConfigureDatabasesAWSPrint(flags configureDatabaseAWSPrintFlags) error {
+	configurator, err := buildAWSConfigurator(true, flags.configureDatabaseAWSFlags)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Check if configurator actions is empty.
+	if configurator.IsEmpty() {
+		fmt.Println("The agent doesn’t require any extra configuration.")
+		return nil
+	}
+
+	actions := configurator.Actions()
+	if flags.policyOnly {
+		// Policy is present at the details of the first action.
+		fmt.Println(actions[0].Details())
+		return nil
+	}
+
+	if flags.boundaryOnly {
+		// Policy boundary is present at the details of the second instruction.
+		fmt.Println(actions[1].Details())
+		return nil
+	}
+
+	printDBConfiguratorActions(actions)
+	return nil
+}
+
+// configureDatabaseAWSPrintFlags flags of the "db configure aws create-iam"
+// subcommand.
+type configureDatabaseAWSCreateFlags struct {
+	configureDatabaseAWSFlags
+	attach  bool
+	confirm bool
+}
+
+// onConfigureDatabasesAWSCreates is a subcommand used to create AWS IAM access
+// for Teleport to run databases discovery on AWS.
+func onConfigureDatabasesAWSCreate(flags configureDatabaseAWSCreateFlags) error {
+	ctx := context.TODO()
+	configurator, err := buildAWSConfigurator(false, flags.configureDatabaseAWSFlags)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	actions := configurator.Actions()
+	printDBConfiguratorActions(actions)
+	fmt.Print("\n")
+
+	if !flags.confirm {
+		confirmed, err := prompt.Confirmation(ctx, os.Stdout, prompt.Stdin(), "Confirm?")
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		if !confirmed {
+			return nil
+		}
+	}
+
+	// Check if configurator actions is empty.
+	if configurator.IsEmpty() {
+		fmt.Println("The agent doesn’t require any extra configuration.")
+		return nil
+	}
+
+	err = executeDBConfiguratorActions(ctx, configurator.Name(), actions)
+	if err != nil {
+		return trace.Errorf("bootstrap failed to execute, check logs above to see the cause")
+	}
+
+	return nil
+}
+
+// printDBConfiguratorActions prints the database configurator actions.
+func printDBConfiguratorActions(actions []dbconfigurators.ConfiguratorAction) {
+	for i, action := range actions {
+		fmt.Printf("%d. %s", i+1, action.Description())
+		if len(action.Details()) > 0 {
+			fmt.Printf(":\n%s\n\n", action.Details())
+		} else {
+			fmt.Println(".")
+		}
+	}
+}
+
+// executeDBConfiguratorActions iterate over all actions, executing and priting
+// their results.
+func executeDBConfiguratorActions(ctx context.Context, configuratorName string, actions []dbconfigurators.ConfiguratorAction) error {
+	actionContext := &dbconfigurators.ConfiguratorActionContext{}
+	for _, action := range actions {
+		err := action.Execute(ctx, actionContext)
+		printDBBootstrapActionResult(configuratorName, action, err)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// printDBBootstrapActionResult human-readable print of the action result (error
+// or success).
+func printDBBootstrapActionResult(configuratorName string, action dbconfigurators.ConfiguratorAction, err error) {
+	leadSymbol := "✅"
+	endText := "done"
+	if err != nil {
+		leadSymbol = "❌"
+		endText = "failed"
+	}
+
+	fmt.Printf("%s[%s] %s... %s.\n", leadSymbol, configuratorName, action.Description(), endText)
+	if err != nil {
+		fmt.Printf("Failure reason: %s\n", err)
+	}
 }
 
 type StdReadWriter struct {
