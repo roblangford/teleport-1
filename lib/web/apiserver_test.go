@@ -1249,58 +1249,79 @@ func (w *windowsDesktopServiceMock) handleConn(t *testing.T, conn *tls.Conn) {
 }
 
 func TestDesktopAccessMFARequiresMfa(t *testing.T) {
-	ctx := context.Background()
-	env := newWebPack(t, 1)
-	proxy := env.proxies[0]
-	pack := proxy.authPack(t, "llama")
-
-	wdID := uuid.New().String()
-	wdMock := mustStartWindowsDesktopMock(t, env.server.Auth())
-	wd, err := types.NewWindowsDesktopV3("desktop1", nil, types.WindowsDesktopSpecV3{
-		Addr:   wdMock.listener.Addr().String(),
-		Domain: "CORP",
-		HostID: wdID,
-	})
-	require.NoError(t, err)
-
-	err = env.server.Auth().UpsertWindowsDesktop(context.Background(), wd)
-	require.NoError(t, err)
-	wds, err := types.NewWindowsDesktopServiceV3(wdID, types.WindowsDesktopServiceSpecV3{
-		Addr:            wdMock.listener.Addr().String(),
-		TeleportVersion: teleport.Version,
-	})
-	require.NoError(t, err)
-
-	_, err = env.server.Auth().UpsertWindowsDesktopService(context.Background(), wds)
-	require.NoError(t, err)
-
-	clt, err := env.server.NewClient(auth.TestUser("llama"))
-	require.NoError(t, err)
-
-	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
-		Type:         constants.Local,
-		SecondFactor: constants.SecondFactorU2F,
-		U2F: &types.U2F{
-			AppID:  "https://localhost",
-			Facets: []string{"https://localhost"},
+	tests := []struct {
+		name           string
+		authPref       types.AuthPreferenceSpecV2
+		mfaHandler     func(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice)
+		registerDevice func(t *testing.T, ctx context.Context, clt *auth.Client) *auth.TestDevice
+	}{
+		{
+			name: "test u2f",
+			authPref: types.AuthPreferenceSpecV2{
+				Type:         constants.Local,
+				SecondFactor: constants.SecondFactorU2F,
+				U2F: &types.U2F{
+					AppID:  "https://localhost",
+					Facets: []string{"https://localhost"},
+				},
+				RequireSessionMFA: true,
+			},
+			mfaHandler: handleMFAU2FCChallengeRDS,
+			registerDevice: func(t *testing.T, ctx context.Context, clt *auth.Client) *auth.TestDevice {
+				dev, err := auth.RegisterTestDevice(ctx, clt, "u2f", apiProto.DeviceType_DEVICE_TYPE_U2F, nil /* authenticator */)
+				require.NoError(t, err)
+				return dev
+			},
 		},
-		RequireSessionMFA: true,
-	})
-	require.NoError(t, err)
-	err = env.server.Auth().SetAuthPreference(ctx, ap)
-	require.NoError(t, err)
+	}
 
-	dev, err := auth.RegisterTestDevice(ctx, clt, "u2f", apiProto.DeviceType_DEVICE_TYPE_U2F, nil /* authenticator */)
-	require.NoError(t, err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			env := newWebPack(t, 1)
+			proxy := env.proxies[0]
+			pack := proxy.authPack(t, "llama")
 
-	ws := proxy.makeDesktopSession(t, pack, session.NewID(), env.server.TLS.Listener.Addr())
-	handleMFAU2FCChallengeRDS(t, ws, dev)
+			clt, err := env.server.NewClient(auth.TestUser("llama"))
+			require.NoError(t, err)
+			wdID := uuid.New().String()
 
-	tdpClient := tdp.NewConn(&WebsocketIO{Conn: ws})
+			wdMock := mustStartWindowsDesktopMock(t, env.server.Auth())
+			wd, err := types.NewWindowsDesktopV3("desktop1", nil, types.WindowsDesktopSpecV3{
+				Addr:   wdMock.listener.Addr().String(),
+				Domain: "CORP",
+				HostID: wdID,
+			})
+			require.NoError(t, err)
 
-	msg, err := tdpClient.InputMessage()
-	require.NoError(t, err)
-	require.IsType(t, tdp.PNGFrame{}, msg)
+			err = env.server.Auth().UpsertWindowsDesktop(context.Background(), wd)
+			require.NoError(t, err)
+			wds, err := types.NewWindowsDesktopServiceV3(wdID, types.WindowsDesktopServiceSpecV3{
+				Addr:            wdMock.listener.Addr().String(),
+				TeleportVersion: teleport.Version,
+			})
+			require.NoError(t, err)
+
+			_, err = env.server.Auth().UpsertWindowsDesktopService(context.Background(), wds)
+			require.NoError(t, err)
+
+			ap, err := types.NewAuthPreference(tc.authPref)
+			require.NoError(t, err)
+			err = env.server.Auth().SetAuthPreference(ctx, ap)
+			require.NoError(t, err)
+
+			dev := tc.registerDevice(t, ctx, clt)
+
+			ws := proxy.makeDesktopSession(t, pack, session.NewID(), env.server.TLS.Listener.Addr())
+			tc.mfaHandler(t, ws, dev)
+
+			tdpClient := tdp.NewConn(&WebsocketIO{Conn: ws})
+
+			msg, err := tdpClient.InputMessage()
+			require.NoError(t, err)
+			require.IsType(t, tdp.PNGFrame{}, msg)
+		})
+	}
 }
 
 func handleMFAU2FCChallengeRDS(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice) {
@@ -1327,48 +1348,6 @@ func handleMFAU2FCChallengeRDS(t *testing.T, ws *websocket.Conn, dev *auth.TestD
 			},
 		},
 	})
-	require.NoError(t, err)
-}
-
-func handleMFAU2FCChallenge(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice) {
-	ty, raw, err := ws.ReadMessage()
-	require.Equal(t, websocket.BinaryMessage, ty)
-	require.NoError(t, err)
-	var e Envelope
-	require.NoError(t, proto.Unmarshal(raw, &e))
-
-	chals := &auth.MFAAuthenticateChallenge{}
-	require.NoError(t, json.Unmarshal([]byte(e.Payload), &chals))
-
-	res, err := dev.SolveAuthn(&apiProto.MFAAuthenticateChallenge{
-		U2F: []*apiProto.U2FChallenge{{
-			KeyHandle: chals.U2FChallenges[0].KeyHandle,
-			Challenge: chals.U2FChallenges[0].Challenge,
-			AppID:     chals.U2FChallenges[0].AppID,
-			Version:   chals.U2FChallenges[0].Version,
-		}},
-	})
-	require.NoError(t, err)
-
-	u2fResBytes, err := json.Marshal(&u2f.AuthenticateChallengeResponse{
-		KeyHandle:     res.GetU2F().KeyHandle,
-		SignatureData: res.GetU2F().Signature,
-		ClientData:    res.GetU2F().ClientData,
-	})
-	require.NoError(t, err)
-
-	encodedPayload, err := unicode.UTF8.NewEncoder().String(string(u2fResBytes))
-	require.NoError(t, err)
-	envelope := &Envelope{
-		Version: defaults.WebsocketVersion,
-		Type:    defaults.WebsocketRaw,
-		Payload: encodedPayload,
-	}
-	envelopeBytes, err := proto.Marshal(envelope)
-	require.NoError(t, err)
-
-	// Send bytes over the websocket to the web client.
-	err = ws.WriteMessage(websocket.BinaryMessage, envelopeBytes)
 	require.NoError(t, err)
 }
 
