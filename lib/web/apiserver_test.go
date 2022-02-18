@@ -1256,7 +1256,7 @@ func TestDesktopAccessMFARequiresMfa(t *testing.T) {
 		registerDevice func(t *testing.T, ctx context.Context, clt *auth.Client) *auth.TestDevice
 	}{
 		{
-			name: "test u2f",
+			name: "u2f",
 			authPref: types.AuthPreferenceSpecV2{
 				Type:         constants.Local,
 				SecondFactor: constants.SecondFactorU2F,
@@ -1266,11 +1266,28 @@ func TestDesktopAccessMFARequiresMfa(t *testing.T) {
 				},
 				RequireSessionMFA: true,
 			},
-			mfaHandler: handleMFAU2FCChallengeRDS,
+			mfaHandler: handleMFAU2FCChallenge,
 			registerDevice: func(t *testing.T, ctx context.Context, clt *auth.Client) *auth.TestDevice {
 				dev, err := auth.RegisterTestDevice(ctx, clt, "u2f", apiProto.DeviceType_DEVICE_TYPE_U2F, nil /* authenticator */)
 				require.NoError(t, err)
 				return dev
+			},
+		},
+		{
+			name: "webauthn",
+			authPref: types.AuthPreferenceSpecV2{
+				Type:         constants.Local,
+				SecondFactor: constants.SecondFactorWebauthn,
+				Webauthn: &types.Webauthn{
+					RPID: "localhost",
+				},
+				RequireSessionMFA: true,
+			},
+			mfaHandler: handleMFAWebauthnChallenge,
+			registerDevice: func(t *testing.T, ctx context.Context, clt *auth.Client) *auth.TestDevice {
+				webauthnDev, err := auth.RegisterTestDevice(ctx, clt, "webauthn", apiProto.DeviceType_DEVICE_TYPE_WEBAUTHN, nil /* authenticator */)
+				require.NoError(t, err)
+				return webauthnDev
 			},
 		},
 	}
@@ -1323,8 +1340,25 @@ func TestDesktopAccessMFARequiresMfa(t *testing.T) {
 		})
 	}
 }
+func handleMFAWebauthnChallenge(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice) {
+	mfaChallange, err := tdp.DecodeMFAChalange(bufio.NewReader(&WebsocketIO{Conn: ws}))
+	require.NoError(t, err)
+	res, err := dev.SolveAuthn(&apiProto.MFAAuthenticateChallenge{
+		WebauthnChallenge: wanlib.CredentialAssertionToProto(mfaChallange.WebauthnChallenge),
+	})
+	require.NoError(t, err)
+	err = tdp.NewConn(&WebsocketIO{Conn: ws}).OutputMessage(tdp.MFA{
+		Type: defaults.WebsocketWebauthnChallenge[0],
+		MFAAuthenticateResponse: &authproto.MFAAuthenticateResponse{
+			Response: &authproto.MFAAuthenticateResponse_Webauthn{
+				Webauthn: res.GetWebauthn(),
+			},
+		},
+	})
+	require.NoError(t, err)
+}
 
-func handleMFAU2FCChallengeRDS(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice) {
+func handleMFAU2FCChallenge(t *testing.T, ws *websocket.Conn, dev *auth.TestDevice) {
 	mfaChallange, err := tdp.DecodeMFAChalange(bufio.NewReader(&WebsocketIO{Conn: ws}))
 	require.NoError(t, err)
 	res, err := dev.SolveAuthn(&apiProto.MFAAuthenticateChallenge{
